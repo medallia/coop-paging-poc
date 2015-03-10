@@ -225,6 +225,7 @@ int main(int argc, char **argv) {
 
         hot.insert(COLUMNS*3/4 + 2);
         sethot(s, hot);
+        sethot(s, hot);
         benchmark("Calc D1", s, hot);
 
         hot.erase(COLUMNS*3/4 + 2);
