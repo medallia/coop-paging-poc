@@ -22,7 +22,7 @@
 #include <future>
 
 #define COLUMNS 600
-#define SEGS 20
+#define SEGS 10
 #define L 65536
 #define SIZE (sizeof(int) * L)
 
@@ -63,7 +63,6 @@ struct Segment {
 
         ++segnum;
 
-//    int *base = (int *) mmap(NULL, SIZE * COLUMNS, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
         printf("Initializing segment %d... %p\n", segnum, NULL);
 
         for(int i = 0; i < COLUMNS; ++i) {
@@ -72,34 +71,20 @@ struct Segment {
             for(int j = 0; j < L; ++j)
                 columns[i][j] = i*j;
 
-//      if (munlock(columns[i], SIZE) != 0) {
-//        perror("munlock");
-//      }
             if (msync(columns[i], SIZE, MS_SYNC) != 0) {
                 perror("msync");
             }
-//      if (madvise(columns[i], SIZE, MADV_SEQUENTIAL) != 0) {
-//        perror("madvise seq");
-//      }
             if (madvise(columns[i], SIZE, MADV_DONTNEED) != 0) {
                 perror("madvise noneed");
             }
 
-//      hot.insert(i);
         }
     }
 
     void sethot(const set<int> &newhot) {
-//    printf("Looping old segment\n");
-        //     printf("Was %d\n", hot.size());
         for(const int oldseg : hot) {
-//            printf("Testing %d\n", oldseg);
             if (newhot.count(oldseg) != 0)
                 continue;
-//           printf("evicting %d\n", oldseg);
-//        if (msync(columns[oldseg], SIZE, MS_SYNC) != 0) {
-//          perror("msync");
-//        }
             if (munlock(columns[oldseg], SIZE) != 0) {
                 perror("munlock");
             }
@@ -110,9 +95,6 @@ struct Segment {
         for(const int seg : newhot) {
             if (hot.count(seg) != 0)
                 continue;
-
-//            printf("Injecting %d\n", seg);
-
             if (madvise(columns[seg], SIZE, MADV_WILLNEED) != 0) {
                 perror("madvise need");
             }
@@ -121,7 +103,6 @@ struct Segment {
             }
         }
         hot = std::set<int>(newhot);
-        //   printf("Now %d\n", hot.size());
     }
 
     int peek(const set<int> &cols) {
@@ -138,7 +119,7 @@ struct Segment {
         int res = 0;
         for(const int &col : cols) {
             int *c = columns[col];
-            for(int j = 0; j < 2; ++j)
+            for(int j = 0; j < 1; ++j)
                 for(int i = 0; i < SIZE; ++i)
                     res += c[i];
         }
@@ -193,18 +174,18 @@ static void sethot(Segment *s, const set<int> &cols) {
 }
 
 int main(int argc, char **argv) {
+  if (mlockall(MCL_CURRENT) != 0) {
+    perror("mlockall");
+  }
+
     init();
+
 
     Segment s[SEGS];
     string d;
 
-//  if (mlockall(MCL_CURRENT/* | MCL_FUTURE*/) != 0) {
-//    perror("mlockall");
-//  }
 
     printf("Done Init\n");
-//  getline(cin, d);
-//  printf("Yeah\n");
 
     int res = 0;
 
@@ -250,6 +231,11 @@ int main(int argc, char **argv) {
         hot.insert(COLUMNS*3/4 + 3);
         benchmark("Calc D2", s, hot, true);
 
+        hot.erase(COLUMNS*3/4 + 3);
+        hot.insert(COLUMNS*3/4 + 4);
+        benchmark("Calc D3", s, hot, false);
+        benchmark("Calc D4", s, hot, false);
+
         hot.clear();
         sethot(s, hot);
 
@@ -263,7 +249,6 @@ int main(int argc, char **argv) {
     }
 
     printf("Done Hot: %d\n", res);
-    getline(cin, d);
 
     post();
 
