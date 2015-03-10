@@ -22,7 +22,7 @@
 #include <future>
 
 #define COLUMNS 600
-#define SEGS 10
+#define SEGS 20
 #define L 65536
 #define SIZE (sizeof(int) * L)
 
@@ -85,9 +85,9 @@ struct Segment {
         for(const int oldseg : hot) {
             if (newhot.count(oldseg) != 0)
                 continue;
-            if (munlock(columns[oldseg], SIZE) != 0) {
-                perror("munlock");
-            }
+//            if (munlock(columns[oldseg], SIZE) != 0) {
+//                perror("munlock");
+//            }
             if (madvise(columns[oldseg], SIZE, MADV_DONTNEED) != 0) {
                 perror("madvise notneed");
             }
@@ -98,9 +98,9 @@ struct Segment {
             if (madvise(columns[seg], SIZE, MADV_WILLNEED) != 0) {
                 perror("madvise need");
             }
-            if (mlock(columns[seg], SIZE) != 0) {
-                perror("mlock");
-            }
+//            if (mlock(columns[seg], SIZE) != 0) {
+//                perror("mlock");
+//            }
         }
         hot = std::set<int>(newhot);
     }
@@ -194,7 +194,7 @@ int main(int argc, char **argv) {
 
         sethot(s, hot);
 
-        for(int j = COLUMNS*3/4; j < COLUMNS; ++j)
+        for(int j = COLUMNS*2/4; j < COLUMNS; ++j)
             hot.insert(j);
         benchmark("Calc II", s, hot);
 
