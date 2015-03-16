@@ -20,7 +20,8 @@
 #include <cassert>
 #include <thread>
 #include <future>
-#include <libaio.h>
+#include <aio.h>
+#include <string.h>
 
 #define COLUMNS 600
 #define SEGS 10
@@ -36,7 +37,7 @@ static vector<int *> unused;
 static int fd;
 
 static void init() {
-    fd = open("/bigfile", O_TRUNC | O_RDWR | O_NONBLOCK | O_DIRECT);
+    fd = open("/bigfile", O_TRUNC | O_RDWR);
     if (fd < 0) {
         perror("open");
     }
@@ -65,19 +66,10 @@ struct Segment {
     int *columns[COLUMNS];
     off_t pos[COLUMNS];
     bool mapped;
-    io_context_t ctxp;
-    int pending;
+    vector<aiocb *> pending;
 
     Segment() {
         mapped = true;
-        pending = 0;
-
-        memset(&ctxp, 0, sizeof(ctxp));
-        int res = io_setup(COLUMNS, &ctxp);
-        if (res != 0) {
-            errno = -res;
-            perror("io_setup");
-        }
 
         ++segnum;
 
@@ -118,7 +110,6 @@ struct Segment {
                 }
             }
         } else {
-            vector<int> toread;
             for(const int col : hot) {
                 if (newhot.count(col) != 0)
                     continue;
@@ -129,26 +120,19 @@ struct Segment {
                 if (hot.count(col) != 0)
                     continue;
                 columns[col] = getint();
-                toread.push_back(col);
-            }
-            const int n = toread.size();
-            pending = n;
-            if (n != 0) {
-                int idx = 0;
-                iocb ios[n];
-                iocb *iosp[n];
-                for(const int col : toread) {
-                    io_prep_pread(& ios[idx], fd, columns[col], SIZE, pos[col] * sizeof(int));
-                    ios[idx].data = NULL;
-                    iosp[idx] = & ios[idx];
-                    ++idx;
-                }
-                int res = io_submit(ctxp, n, iosp);
-                if (res != n) {
-                    printf("Got back %d\n", res);
-                    errno = -res;
-                    perror("io_submit");
-                }
+
+                aiocb *io = new aiocb();
+                memset(io, 0, sizeof(aiocb));
+                io->aio_fildes = fd;
+                io->aio_lio_opcode = LIO_READ;
+                io->aio_buf = columns[col];
+                io->aio_nbytes = SIZE;
+                io->aio_offset = pos[col] * sizeof(int);
+
+                if (aio_read(io) != 0)
+                    perror("aio_read");
+
+                pending.push_back(io);
             }
         }
 
@@ -166,14 +150,31 @@ struct Segment {
     }
 
     int calc(const set<int> &cols) {
-        if (pending != 0) {
-            struct io_event events[pending];
-            int res = io_getevents(ctxp, pending, pending, events, NULL);
-            if (res != pending) {
-                printf("got back %d\n", res);
-                perror("io_getevents");
+        while (! pending.empty()) {
+            const int n = pending.size();
+            aiocb *ptrs[n];
+            for(int i = 0; i < n; ++i)
+                ptrs[i] = pending[i];
+            if (aio_suspend(ptrs, n, NULL) != 0)
+                perror("aio_suspend");
+                
+            pending.clear();
+            for(int i = 0; i < n; ++i) {
+                aiocb *io = ptrs[i];
+                int e = aio_error(io);
+                if (e == EINPROGRESS) {
+                    pending.push_back(io);
+                    continue;
+                }
+                if (e != 0) {
+                    perror("aio_error");
+                }
+                if (aio_return(io) != SIZE) {
+                    perror("aio_return");
+                }
+                
+                delete io;
             }
-            pending = 0;
         }
         int res = 0;
         for(const int &col : cols) {
@@ -326,6 +327,16 @@ int main(int argc, char **argv) {
         sethot(s, hot);
         benchmark("Calc G1", s, hot);
         benchmark("Calc G2", s, hot);
+
+        for(int j = 0; j < 5; ++j) {
+            hot.clear();
+            int block = j % 4;
+            for(int i = (COLUMNS * block) / 4; i < (COLUMNS * (block+1)) / 4; ++i)
+                hot.insert(i);
+            sethot(s, hot);
+            benchmark("Calc H1", s, hot);
+            benchmark("Calc H2", s, hot);
+        }
 
     }
 }
