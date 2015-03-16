@@ -20,21 +20,23 @@
 #include <cassert>
 #include <thread>
 #include <future>
+#include <libaio.h>
 
 #define COLUMNS 600
-#define SEGS 20
+#define SEGS 10
 #define L 65536
 #define SIZE (sizeof(int) * L)
 
 using namespace std;
 
-int *filebase = NULL;
-int *rebase = NULL;
-
-int segnum = -1;
+static int *filebase = NULL;
+static int *rebase = NULL;
+static int segnum = -1;
+static vector<int *> unused;
+static int fd;
 
 static void init() {
-    int fd = open("/bigfile", O_TRUNC | O_RDWR);
+    fd = open("/bigfile", O_TRUNC | O_RDWR | O_NONBLOCK | O_DIRECT);
     if (fd < 0) {
         perror("open");
     }
@@ -50,23 +52,40 @@ static void init() {
     rebase = filebase;
 }
 
-static void post() {
-    if (madvise(filebase, SIZE * COLUMNS * SEGS, MADV_REMOVE) != 0) {
-        perror("madvise punch");
-    }
+static int *getint() {
+    if (unused.empty())
+        return new int[L];
+    int *p = unused.back();
+    unused.pop_back();
+    return p;
 }
 
 struct Segment {
     set<int> hot;
     int *columns[COLUMNS];
+    off_t pos[COLUMNS];
+    bool mapped;
+    io_context_t ctxp;
+    int pending;
+
     Segment() {
+        mapped = true;
+        pending = 0;
+
+        memset(&ctxp, 0, sizeof(ctxp));
+        int res = io_setup(COLUMNS, &ctxp);
+        if (res != 0) {
+            errno = -res;
+            perror("io_setup");
+        }
 
         ++segnum;
 
         printf("Initializing segment %d... %p\n", segnum, NULL);
 
         for(int i = 0; i < COLUMNS; ++i) {
-            columns[i] = & filebase[COLUMNS*L*segnum + i * L];
+            pos[i] = COLUMNS*L*segnum + i*L;
+            columns[i] = & filebase[pos[i]];
 
             for(int j = 0; j < L; ++j)
                 columns[i][j] = i*j;
@@ -82,26 +101,57 @@ struct Segment {
     }
 
     void sethot(const set<int> &newhot) {
-        for(const int oldseg : hot) {
-            if (newhot.count(oldseg) != 0)
-                continue;
-//            if (munlock(columns[oldseg], SIZE) != 0) {
-//                perror("munlock");
-//            }
-            if (madvise(columns[oldseg], SIZE, MADV_DONTNEED) != 0) {
-                perror("madvise notneed");
+        if (mapped) {
+
+            for(const int oldseg : hot) {
+                if (newhot.count(oldseg) != 0)
+                    continue;
+                if (madvise(columns[oldseg], SIZE, MADV_DONTNEED) != 0) {
+                    perror("madvise notneed");
+                }
+            }
+            for(const int seg : newhot) {
+                if (hot.count(seg) != 0)
+                    continue;
+                if (madvise(columns[seg], SIZE, MADV_WILLNEED) != 0) {
+                    perror("madvise need");
+                }
+            }
+        } else {
+            vector<int> toread;
+            for(const int col : hot) {
+                if (newhot.count(col) != 0)
+                    continue;
+                unused.push_back(columns[col]);
+                columns[col] = NULL;
+            }
+            for(const int col : newhot) {
+                if (hot.count(col) != 0)
+                    continue;
+                columns[col] = getint();
+                toread.push_back(col);
+            }
+            const int n = toread.size();
+            pending = n;
+            if (n != 0) {
+                int idx = 0;
+                iocb ios[n];
+                iocb *iosp[n];
+                for(const int col : toread) {
+                    io_prep_pread(& ios[idx], fd, columns[col], SIZE, pos[col] * sizeof(int));
+                    ios[idx].data = NULL;
+                    iosp[idx] = & ios[idx];
+                    ++idx;
+                }
+                int res = io_submit(ctxp, n, iosp);
+                if (res != n) {
+                    printf("Got back %d\n", res);
+                    errno = -res;
+                    perror("io_submit");
+                }
             }
         }
-        for(const int seg : newhot) {
-            if (hot.count(seg) != 0)
-                continue;
-            if (madvise(columns[seg], SIZE, MADV_WILLNEED) != 0) {
-                perror("madvise need");
-            }
-//            if (mlock(columns[seg], SIZE) != 0) {
-//                perror("mlock");
-//            }
-        }
+
         hot = std::set<int>(newhot);
     }
 
@@ -109,21 +159,36 @@ struct Segment {
         int res = 0;
         for(const int &col : cols) {
             int *c = columns[col];
-            for(int i = 0; i < SIZE; i+=1024)
+            for(int i = 0; i < L; i+=1024)
                 res += c[i];
         }
         return res;
     }
 
     int calc(const set<int> &cols) {
+        if (pending != 0) {
+            struct io_event events[pending];
+            int res = io_getevents(ctxp, pending, pending, events, NULL);
+            if (res != pending) {
+                printf("got back %d\n", res);
+                perror("io_getevents");
+            }
+            pending = 0;
+        }
         int res = 0;
         for(const int &col : cols) {
             int *c = columns[col];
-            for(int j = 0; j < 1; ++j)
-                for(int i = 0; i < SIZE; ++i)
-                    res += c[i];
+            for(int j = 0; j < 32; ++j)
+                for(int i = 0; i < L; ++i)
+                    res += c[i] + j;
         }
         return res;
+    }
+
+    void unmap() {
+        for(int i = 0; i < COLUMNS; ++i)
+            columns[i] = NULL;
+        mapped = false;
     }
 
 };
@@ -135,13 +200,15 @@ static void benchmark(const std::string &str, Segment *s, const set<int> &cols, 
 
     if (peekaboo) {
         f[1] = std::async( std::launch::async, [=]() {
-        int res = 0;
-        for(int snum = 0; snum < SEGS; ++snum)
-            res += s[snum].peek(cols);
-        return res;
+            int res = 0;
+            for(int snum = 0; snum < SEGS; ++snum)
+                res += s[snum].peek(cols);
+            return res;
         });
     } else {
-        f[1] = std::async([]() { return 0; });
+        f[1] = std::async([]() {
+            return 0;
+        });
     }
 
     f[0] = std::async( std::launch::async, [=]() {
@@ -150,7 +217,7 @@ static void benchmark(const std::string &str, Segment *s, const set<int> &cols, 
             res += s[snum].calc(cols);
         return res;
     });
-    
+
     int res = f[0].get();
     f[1].get();
 
@@ -173,21 +240,21 @@ static void sethot(Segment *s, const set<int> &cols) {
     cout << "SetHot " << elapsed_seconds.count() << endl;
 }
 
+static void phaseshift(Segment *s) {
+    if (munmap(filebase, SIZE * COLUMNS * SEGS) != 0) {
+        perror("munmap");
+    }
+    for(int i = 0; i < SEGS; ++i)
+        s[i].unmap();
+}
+
 int main(int argc, char **argv) {
-  if (mlockall(MCL_CURRENT) != 0) {
-    perror("mlockall");
-  }
-
     init();
-
 
     Segment s[SEGS];
     string d;
 
-
     printf("Done Init\n");
-
-    int res = 0;
 
     {
         set<int> hot;
@@ -247,10 +314,18 @@ int main(int argc, char **argv) {
                 hot.insert(i);
             benchmark("Calc E", s, hot);
         }
+
+        phaseshift(s);
+
+        sethot(s, hot);
+        benchmark("Calc F1", s, hot);
+        benchmark("Calc F2", s, hot);
+
+        hot.insert(COLUMNS * 3 / 4);
+        hot.insert(0);
+        sethot(s, hot);
+        benchmark("Calc G1", s, hot);
+        benchmark("Calc G2", s, hot);
+
     }
-
-    printf("Done Hot: %d\n", res);
-
-    post();
-
 }
